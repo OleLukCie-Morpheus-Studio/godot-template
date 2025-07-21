@@ -1,2 +1,2 @@
 # godot-template
-Template for Godot-4.4-stable
+Game Template (and other things) for Godot-4.4-stable
