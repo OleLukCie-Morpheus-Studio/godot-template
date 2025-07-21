@@ -1,0 +1,15 @@
+shader_type spatial;
+render_mode unshaded, cull_front;
+
+uniform float strength:hint_range(0,01) = 0.002;
+void vertex(){
+	vec3 offset = NORMAL;
+	float v2c_dist = clamp((MODELVIEW_MATRIX * vec4(VERTEX, 1.0)).z * -1.0,0.0,50.0);
+	offset.z *= COLOR.b;
+	
+	VERTEX += offset*strength*COLOR.a*v2c_dist*COLOR.g;
+}
+
+void fragment(){
+	ALBEDO = vec3(0f);
+}

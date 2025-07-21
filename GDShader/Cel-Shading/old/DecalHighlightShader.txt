@@ -1,0 +1,12 @@
+shader_type spatial;
+render_mode ambient_light_disabled;
+
+uniform sampler2D decal;
+uniform sampler2D base;
+
+
+void light(){
+	vec4 decal_color = texture(decal,UV);
+	ALPHA = (decal_color.r-0.5)/0.5f;
+	DIFFUSE_LIGHT += decal_color.rgb/0.5f;
+}

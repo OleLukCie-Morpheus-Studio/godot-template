@@ -1,0 +1,265 @@
+代码使用Godot引擎专用的着色器语言GDShader（类似于GLSL着色语言）
+
+在顶点函数 vertex() 中，
+添加 POSITION = vec4(VERTEX.xy, 1.0, 1.0); 这行代码，
+这行代码让四边形网格始终覆盖整个屏幕，顶点适配屏幕四角。
+void vertex() {
+	POSITION = vec4(VERTEX.xy, 1.0, 1.0);
+}
+
+
+
+要创建轮廓线，就需要利用屏幕空间的深度和法线纹理来检测图像边缘。
+基本原理：逐像素比较其与周围像素的数值差异，当差异足够大时，即可判定为边缘。
+例如：将深度纹理的UV坐标向左偏移1像素，然后用原始深度值减去偏移后的值，对结果取绝对值，就能得到每个像素左侧的深度差异；重复这个操作，向右偏移1像素，上下偏移，然后将所有结果相加；最后设置阈值来控制轮廓检测的敏感度。阈值越高，只有更明显的深度变化才会生成轮廓线。
+【使用0.3的阈值 Threshold=0.3】
+
+
+
+编写着色器的代码，第一步是获取所需的屏幕空间信息，具体需要用到屏幕纹理、深度纹理，以及法线粗糙度纹理。
+为每种纹理创建单独的uniform变量
+uniform sampler2D DEPTH_TEXTURE : hint_depth_texture, filter_linear_mipmap;
+uniform sampler2D SCREEN_TEXTURE : hint_screen_texture, filter_nearest;
+uniform sampler2D NORMAL_TEXTURE : hint_normal_roughness_texture, filter_nearest;
+
+先从深度纹理开始处理，但在使用前需要将其从非线性转换为线性深度值。转换方法：
+	uniform sampler2D depth_texture : hint_depth_texture;
+	float depth = texture(depth_texture, SCREEN_UV).x;
+	void fragment(){
+		float depth = texture(depth_texture, SCREEN_UV).x;
+		vec3 ndc = vec3(SCREEN_UV * 2.0 - 1.0, depth);
+	}
+这个转换需要重复多次，因此将其封装成函数，并添加UV偏移参数方便复用
+float GetLinearDepth(vec2 sUV, sampler2D depthTexture, mat4 invProjectionMat){
+	float depth = texture(depthTexture, sUV).x;
+	vec3 ndc = vec3(sUV * 2.0 - 1.0, depth);
+	vec4 view = invProjectionMat * vec4(ndc, 1.0);
+	view.xyz /= view.w;
+	return -view.z;
+}
+完成深度转换函数后，在片段函数中通过偏移UV坐标，并比较原始深度值来检测边缘
+float depth = GetLinearDepth(SCREEN_UV, DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+可以向左、右、上、下偏移像素，用像素尺寸乘以偏移量调整UV坐标
+float depthLeft = GetLinearDepth(SCREEN_UV + vec2(-1.0, 0.0) * texelSize, DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+float depthRight = GetLinearDepth(SCREEN_UV + vec2(1.0, 0.0) * texelSize, DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+float depthUp = GetLinearDepth(SCREEN_UV + vec2(0.0, -1.0) * texelSize, DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+float depthDown = GetLinearDepth(SCREEN_UV + vec2(0.0, 1.0) * texelSize, DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+
+计算单个像素尺寸，1除以视口尺寸
+void fragment() {
+	vec2 texelSize = 1.0 / VIEWPORT_SIZE.xy;
+}
+
+获取边缘结果，用偏移后的深度值减去原始深度值
+depthDifference = depthLeft - depth;//向左偏移
+depthDifference = depthRight - depth;//向右偏移
+depthDifference = depthUp - depth;//向上偏移
+depthDifference = depthDown - depth;//向下偏移
+depthDifference = (depthLeft - depth) + (depthRight - depth) + (depthUp - depth) + (depthDown - depth);
+
+这些偏移UV值会重复使用，因此将UV坐标存入数组便于管理
+vec2 UVOffsets[4];
+UVOffsets[0] = SCREEN_UV + vec2(0.0, -1.0) * texelSize;
+UVOffsets[1] = SCREEN_UV + vec2(0.0, 1.0) * texelSize;
+UVOffsets[2] = SCREEN_UV + vec2(1.0, 0.0) * texelSize;
+UVOffsets[3] = SCREEN_UV + vec2(-1.0, 0.0) * texelSize;
+
+通过遍历UV偏移数组来简化深度采样代码，使用循环处理所有采样计算，叠加结果时需要使用clamp限制数值范围
+float depthDifference = 0.0;
+float depth = GetLinearDepth(SCREEN_UV, DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+for(int i = 0; i < UVOffsets.length(); i++){
+	float dOff = GetLinearDepth(UVOffsets[i],DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+	depthDifference += clamp(dOff - depth, 0.0, 1.0);
+}
+此时可以看到基于深度计算生成的轮廓线，但还需优化，只保留外轮廓线。
+
+通过阈值过滤较小数值变化，使用step函数进行阈值判断，注意step函数的阈值参数可能需要根据项目实际情况调整
+depthDifference = smoothstep(0.25, 0.3, depthDifference);
+
+
+如果想在模型内部边缘也绘制轮廓线，就需要用到屏幕法线纹理，处理流程与深度纹理相似。
+新建函数来采样带偏移UV的法线纹理，此时无需将数值转换为线性，但默认法线值范围是0~1，需要转换到-1~1的范围
+（只需将法线值乘以2再减1）
+vec3 GetNormal(vec2 uv, sampler2D normalTexture){
+	vec3 normal = texture(normalTexture, uv).rgb;
+	normal = normal * 2.0 - 1.0;
+	return normal;
+}
+
+类似深度处理方式，现在可以用法线值检测边缘。不过由于法线是向量，不是简单相减，而是计算相邻像素法线向量的点积，计算结果反映两者之间的角度差异。使用smoothstep函数设置阈值过滤结果，和深度处理类似。
+float normalDifference = 0.0;
+vec3 normal = GetNormal(SCREEN_UV, NORMAL_TEXTURE);
+for(int i = 0; i < UVOffsets.length(); i++){
+	vec3 nOff = GetNormal(UVOffsets[i],NORMAL_TEXTURE);
+	normalDifference += 1.0 - dot(normal, nOff);
+}
+normalDifference = smoothstep(0.2, 0.2, normalDifference);
+此时可以看到四向偏移后的法线边缘检测效果，这次检测的是物体内部边缘，不过当前实现的轮廓线是双像素宽度，需要优化。
+
+使用特定函数获取更清晰的单像素轮廓。
+新建处理函数，接收法线边缘偏移参数，稍后定义具体值（当前像素法线、相邻像素法线以及深度边缘检测结果），定义变量结合深度信息和法线偏移参数进行阈值处理，接着计算当前与相邻像素法线的点积，并将结果乘以定义的变量进行混合
+float NormalEdgeIndicator(vec3 normalEdgeBias, vec3 normal, vec3 neighborNormal, float depthDifference){
+	//From Kody King: https://threejs.org/examples/webgl_postprocessing_pixel.html
+	float normalDifference = dot(normal - neighborNormal, normalEdgeBias);
+	float normalIndicator = clamp(smoothstep(-.01, .01, normalDifference), 0.0, 1.0);
+	float depthIndicator = clamp(sign(depthDifference * .25 + .0025), 0.0, 1.0);
+	return (1.0 - dot(normal, neighborNormal)) * depthIndicator * normalIndicator;
+}
+完成设置后，更新循环使用新的法线边缘检测函数
+float normalDifference = 0.;
+	vec3 normalEdgeBias = (vec3(1.0, 1.0, 1.0));
+	vec3 normal = GetNormal(SCREEN_UV, NORMAL_TEXTURE);
+
+	for(int i = 0; i < UVOffests.length(); i++){
+		vec3 nOff = GetNormal(UVOffsets[i].NORMAL_TEXTURE);
+		normalDifference += NormalEdgeIndicator(normalEdgeBias, normal, nOff, depthDifference);
+	}
+	normalDifference = smoothstep(0.2, 0.2, normalDifference);
+优化后的法线边缘检测效果将深度和法线边缘结合得更完美，只需叠加结果并用clamp限制范围
+float finalEdge = clamp(normalDifference + depthDifference, 0.0, 1.0);
+但注意到有些外边缘出现了双重轮廓线，而理想效果是清晰的单像素轮廓。
+需要创建遮罩隔离外轮廓，取深度边缘检测的反相结果。在深度计算前初始化浮点数为0.5，在深度循环中，反转原本的深度计算逻辑，用主深度值减去偏移后的深度，并将结果累加到新变量，完成后使用smoothstep设置阈值，乘以高值锐化边缘并用clamp限制。用这个遮罩减去法线边缘结果并限制范围
+loat depthDifference = 0.0;
+float invDepthDifference = 0.5;
+float depth = GetLinearDepth(SCREEN_UV, DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+
+for (int i = 0; i < UVOffsets.length(); i++){
+	float dOff = GetLinearDepth(UVOffsets[i],DEPTH_TEXTURE, INV_PROJECTION_MATRIX);
+	depthDifference += clamp(dOff - depth, 0.0, 1.0);
+	invDepthDifference += depth - dOff;
+}
+invDepthDifference = clamp(invDepthDifference, 0.0, 1.0);
+invDepthDifference = clamp(smoothstep(0.9, 0.9, invDepthDifference) * 10.0 , 0.0, 1.0);
+depthDifference = smoothstep(0.25, 0.3, depthDifference);
+
+还需要将轮廓线与屏幕渲染效果进行合成，创建两个参数分别控制高亮线（内边缘）和暗线（外轮廓）
+uniform float lineHighlight = 0.2;
+uniform float lineShadow = 0.55;
+通过法线差减去深度差获取内边缘并限制结果范围
+float innerLines = clamp(normalDifference - depthDifference, 0.0, 1.0);
+
+将屏幕纹理设为albedo（反照率贴图）后，叠加高亮内边缘，外轮廓用暗线参数相乘处理
+ALBEDO = texture(SCREEN_TEXTURE, SCREEN_UV).rgb;
+ALBEDO += innerLines * lineHighlight;
+ALBEDO -= ALBEDO * depthDifference * lineShadow;
+最终完成的明暗双线效果非常接近传统像素风
+
+通过调整参数能改变轮廓表现。轮廓线还能实现更多效果，比如根据场景光照而变化。
+
+edge_detection.gdshader完整代码：
+shader_type spatial;
+render_mode specular_disabled, ambient_light_disabled;
+
+uniform sampler2D DEPTH_TEXTURE : hint_depth_texture, filter_linear_mipmap;
+uniform sampler2D SCREEN_TEXTURE : hint_screen_texture, filter_nearest;
+uniform sampler2D NORMAL_TEXTURE : hint_normal_roughness_texture, filter_nearest;
+
+uniform float lightIntensity = 1.25;
+uniform float lineAlpha = 0.7;
+uniform bool useLighting = true;
+uniform float lineHighlight = 0.2;
+uniform float lineShadow = 0.55;
+
+varying vec2 screenUV;
+varying float lineMask;
+
+
+float GetLinearDepth(vec2 sUV, sampler2D depthTexture, mat4 invProjectionMat, float mask){
+	// Raw depth to linear depth code from:
+	// https://docs.godotengine.org/en/latest/tutorials/shaders/advanced_postprocessing.html
+	float depth = texture(depthTexture, sUV).x * mask;
+	vec3 ndc = vec3(sUV * 2.0 - 1.0, depth);
+    vec4 view = invProjectionMat * vec4(ndc, 1.0);
+	view.xyz /= view.w;
+	return -view.z;
+}
+
+vec3 GetNormal(vec2 uv, sampler2D normalTexture, float mask){
+	vec3 normal = texture(normalTexture, uv).rgb;
+	normal = normal * 2.0 - 1.0 * mask;
+	return normal;
+}
+
+float NormalEdgeIndicator(vec3 normalEdgeBias, vec3 normal, vec3 neighborNormal, float depthDifference){
+	//From Kody King: https://threejs.org/examples/webgl_postprocessing_pixel.html
+	float normalDifference = dot(normal - neighborNormal, normalEdgeBias);
+	float normalIndicator = clamp(smoothstep(-.01, .01, normalDifference), 0.0, 1.0);
+	float depthIndicator = clamp(sign(depthDifference * .25 + .0025), 0.0, 1.0);
+	return (1.0 - dot(normal, neighborNormal)) * depthIndicator * normalIndicator;
+}
+
+void vertex(){
+  POSITION = vec4(VERTEX.xy, 1.0, 1.0);
+}
+
+void fragment() {
+	vec2 texelSize = 1.0 / VIEWPORT_SIZE.xy;
+	screenUV = SCREEN_UV;
+
+	// UV offsets
+	vec2 UVOffsets[4];
+	UVOffsets[0] = SCREEN_UV + vec2(0.0, -1.0) * texelSize;
+	UVOffsets[1] = SCREEN_UV + vec2(0.0, 1.0) * texelSize;
+	UVOffsets[2] = SCREEN_UV + vec2(1.0, 0.0) * texelSize;
+	UVOffsets[3] = SCREEN_UV + vec2(-1.0, 0.0) * texelSize;
+
+	// Using alpha channel (screen roughness) to mask objects to not receive outlines
+	float outlineMask = texture(NORMAL_TEXTURE, SCREEN_UV).a;
+	outlineMask = ceil(outlineMask); // Objects with Roughness = 0 will not have and outline
+
+	// Edge detection with Depth
+	float depthDifference = 0.0;
+	float invDepthDifference = 0.5;
+	float depth = GetLinearDepth(SCREEN_UV, DEPTH_TEXTURE, INV_PROJECTION_MATRIX, outlineMask);
+
+	for (int i = 0; i < UVOffsets.length(); i++){
+		float dOff = GetLinearDepth(UVOffsets[i],DEPTH_TEXTURE, INV_PROJECTION_MATRIX, outlineMask);
+		depthDifference += clamp(dOff - depth, 0.0, 1.0);
+		invDepthDifference += depth - dOff;
+	}
+	invDepthDifference = clamp(invDepthDifference, 0.0, 1.0);
+	invDepthDifference = clamp(smoothstep(0.9, 0.9, invDepthDifference) * 10.0 , 0.0, 1.0);
+	depthDifference = smoothstep(0.25, 0.3, depthDifference);
+
+	// Edge detection with Normals
+	float normalDifference = 0.;
+	vec3 normalEdgeBias = vec3(1.0, 1.0, 1.0);
+	vec3 normal = GetNormal(SCREEN_UV, NORMAL_TEXTURE, outlineMask);
+
+	for (int i = 0; i < UVOffsets.length(); i++){
+		vec3 nOff = GetNormal(UVOffsets[i],NORMAL_TEXTURE, outlineMask);
+		normalDifference += NormalEdgeIndicator(normalEdgeBias, normal, nOff, depthDifference);
+	}
+	normalDifference = smoothstep(0.2, 0.2, normalDifference);
+	normalDifference = clamp(normalDifference - invDepthDifference, 0.0, 1.0);
+
+
+	ALBEDO = texture(SCREEN_TEXTURE, SCREEN_UV).rgb;
+	lineMask = clamp(0.1, lineAlpha, (depthDifference + normalDifference * 5.0));
+
+
+	if (!useLighting){
+		ALBEDO += clamp((normalDifference - depthDifference), 0.0, 1.0) * lineHighlight;
+		ALBEDO -= ALBEDO * depthDifference * lineShadow;
+	}
+}
+
+void light (){
+	if (useLighting){
+		vec4 normal = texture(NORMAL_TEXTURE, screenUV);
+		normal = normal * 2.0 - 1.0;
+
+		// Calculate light direction
+		float dotNL = dot(normal.rgb, LIGHT);
+		dotNL = pow(dotNL, 2.5);
+		dotNL = clamp(dotNL, 0.0, 1.0);
+
+		if(LIGHT_IS_DIRECTIONAL)
+			DIFFUSE_LIGHT += mix(vec3(1.0), dotNL * LIGHT_COLOR * lightIntensity, lineMask);
+	}
+	else
+		DIFFUSE_LIGHT = vec3(1.0);
+}
+
+
+

@@ -1,0 +1,127 @@
+shader_type spatial;  // 声明为3D空间着色器
+render_mode specular_disabled, ambient_light_disabled;  // 禁用镜面反射和环境光计算
+
+// 屏幕深度纹理采样器（用于检测深度边缘）
+uniform sampler2D DEPTH_TEXTURE : hint_depth_texture, filter_linear_mipmap;
+// 屏幕颜色纹理采样器（用于获取基础画面）
+uniform sampler2D SCREEN_TEXTURE : hint_screen_texture, filter_nearest;
+// 法线和粗糙度纹理采样器（用于检测法线边缘）
+uniform sampler2D NORMAL_TEXTURE : hint_normal_roughness_texture, filter_nearest;
+
+uniform float lightIntensity = 1.25;  // 光照强度
+uniform float lineAlpha = 0.7;  // 轮廓线透明度
+uniform bool useLighting = true;  // 是否启用光照计算
+uniform float lineHighlight = 0.2;  // 轮廓线高亮强度
+uniform float lineShadow = 0.55;  // 轮廓线阴影强度
+
+varying vec2 screenUV;  // 屏幕UV坐标（传递到片段着色器）
+varying float lineMask;  // 轮廓线遮罩值（传递到片段着色器）
+
+// 将深度值转换为线性空间深度（用于边缘检测）
+float GetLinearDepth(vec2 sUV, sampler2D depthTexture, mat4 invProjectionMat, float mask){
+    float depth = texture(depthTexture, sUV).x * mask;  // 采样深度值并应用遮罩
+    vec3 ndc = vec3(sUV * 2.0 - 1.0, depth);  // 转换到标准化设备坐标
+    vec4 view = invProjectionMat * vec4(ndc, 1.0);  // 逆投影变换到视图空间
+    view.xyz /= view.w;  // 透视除法
+    return -view.z;  // 返回线性深度（取负是因为Z轴指向屏幕内）
+}
+
+// 从法线纹理中获取法线向量
+vec3 GetNormal(vec2 uv, sampler2D normalTexture, float mask){
+    vec3 normal = texture(normalTexture, uv).rgb;  // 采样法线纹理
+    normal = normal * 2.0 - 1.0 * mask;  // 从[0,1]范围转换到[-1,1]范围并应用遮罩
+    return normal;  // 返回标准化法线向量
+}
+
+// 计算法线边缘指示器（用于检测表面法线变化形成的边缘）
+float NormalEdgeIndicator(vec3 normalEdgeBias, vec3 normal, vec3 neighborNormal, float depthDifference){
+    float normalDifference = dot(normal - neighborNormal, normalEdgeBias);  // 计算法线差异
+    float normalIndicator = clamp(smoothstep(-.01, .01, normalDifference), 0.0, 1.0);  // 平滑法线差异
+    float depthIndicator = clamp(sign(depthDifference * .25 + .0025), 0.0, 1.0);  // 深度差异指示器
+    return (1.0 - dot(normal, neighborNormal)) * depthIndicator * normalIndicator;  // 返回综合边缘强度
+}
+
+// 顶点着色器（设置顶点位置为屏幕空间）
+void vertex(){
+    POSITION = vec4(VERTEX.xy, 1.0, 1.0);  // 直接设置顶点位置到屏幕空间（全屏四边形）
+}
+
+// 片段着色器（处理每个像素的颜色计算）
+void fragment() {
+    vec2 texelSize = 1.0 / VIEWPORT_SIZE.xy;  // 计算纹理像素大小
+    screenUV = SCREEN_UV;  // 获取屏幕UV坐标
+
+    // 定义4个方向的采样偏移（上、下、右、左）
+    vec2 UVOffsets[4];
+    UVOffsets[0] = SCREEN_UV + vec2(0.0, -1.0) * texelSize;
+    UVOffsets[1] = SCREEN_UV + vec2(0.0, 1.0) * texelSize;
+    UVOffsets[2] = SCREEN_UV + vec2(1.0, 0.0) * texelSize;
+    UVOffsets[3] = SCREEN_UV + vec2(-1.0, 0.0) * texelSize;
+
+    float outlineMask = texture(NORMAL_TEXTURE, SCREEN_UV).a;  // 获取轮廓遮罩（来自法线纹理的Alpha通道）
+    outlineMask = ceil(outlineMask);  // 向上取整，转换为二值遮罩
+
+    // 计算深度边缘检测相关值
+    float depthDifference = 0.0;  // 深度差异总和
+    float invDepthDifference = 0.5;  // 反向深度差异（用于背面边缘）
+    float depth = GetLinearDepth(SCREEN_UV, DEPTH_TEXTURE, INV_PROJECTION_MATRIX, outlineMask);  // 当前像素深度
+
+    // 采样周围像素深度并计算差异
+    for (int i = 0; i < UVOffsets.length(); i++){
+        float dOff = GetLinearDepth(UVOffsets[i], DEPTH_TEXTURE, INV_PROJECTION_MATRIX, outlineMask);
+        depthDifference += clamp(dOff - depth, 0.0, 1.0);  // 累积前向深度差异
+        invDepthDifference += depth - dOff;  // 累积反向深度差异
+    }
+
+    // 处理反向深度差异（背面边缘）
+    invDepthDifference = clamp(invDepthDifference, 0.0, 1.0);
+    invDepthDifference = clamp(smoothstep(0.9, 0.9, invDepthDifference) * 10.0, 0.0, 1.0);
+
+    // 平滑并限制深度差异范围
+    depthDifference = smoothstep(0.25, 0.3, depthDifference);
+
+    // 计算法线边缘检测相关值
+    float normalDifference = 0.0;  // 法线差异总和
+    vec3 normalEdgeBias = vec3(1.0, 1.0, 1.0);  // 法线边缘检测偏置
+    vec3 normal = GetNormal(SCREEN_UV, NORMAL_TEXTURE, outlineMask);  // 当前像素法线
+
+    // 采样周围像素法线并计算差异
+    for (int i = 0; i < UVOffsets.length(); i++){
+        vec3 nOff = GetNormal(UVOffsets[i], NORMAL_TEXTURE, outlineMask);
+        normalDifference += NormalEdgeIndicator(normalEdgeBias, normal, nOff, depthDifference);
+    }
+
+    // 平滑并限制法线差异范围
+    normalDifference = smoothstep(0.2, 0.2, normalDifference);
+    normalDifference = clamp(normalDifference - invDepthDifference, 0.0, 1.0);
+
+    // 设置基础颜色为屏幕纹理颜色
+    ALBEDO = texture(SCREEN_TEXTURE, SCREEN_UV).rgb;
+
+    // 计算最终轮廓线遮罩（结合深度和法线边缘）
+    lineMask = clamp(0.1, lineAlpha, (depthDifference + normalDifference * 5.0));
+
+    // 如果禁用光照，则直接应用轮廓线效果
+    if (!useLighting){
+        ALBEDO += clamp((normalDifference - depthDifference), 0.0, 1.0) * lineHighlight;  // 添加轮廓线高亮
+        ALBEDO -= ALBEDO * depthDifference * lineShadow;  // 添加轮廓线阴影
+    }
+}
+
+// 光照计算函数（处理每个光照对像素的影响）
+void light (){
+    if (useLighting){  // 如果启用光照
+        vec4 normal = texture(NORMAL_TEXTURE, screenUV);  // 采样法线纹理
+        normal = normal * 2.0 - 1.0;  // 从[0,1]范围转换到[-1,1]范围
+
+        float dotNL = dot(normal.rgb, LIGHT);  // 计算法线与光照方向的点积
+        dotNL = pow(dotNL, 2.5);  // 应用幂函数调整光照分布
+        dotNL = clamp(dotNL, 0.0, 1.0);  // 限制范围
+
+        // 如果是方向光，根据轮廓线遮罩混合光照效果
+        if(LIGHT_IS_DIRECTIONAL)
+            DIFFUSE_LIGHT += mix(vec3(1.0), dotNL * LIGHT_COLOR * lightIntensity, lineMask);
+    }
+    else
+        DIFFUSE_LIGHT = vec3(1.0);  // 如果禁用光照，使用纯白色漫反射
+}

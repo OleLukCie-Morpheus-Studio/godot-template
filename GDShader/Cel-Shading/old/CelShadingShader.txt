@@ -1,0 +1,54 @@
+shader_type spatial;
+render_mode ambient_light_disabled;
+
+
+uniform sampler2D base:hint_albedo;
+uniform sampler2D sss:hint_albedo;
+uniform sampler2D ilm:hint_albedo;
+
+uniform float shinese= 32f;
+
+uniform float shade_threshold:hint_range(0,1)=0.3;
+uniform float spec_threshold:hint_range(0,0.01)=0.05f;
+
+varying vec4 v_color;
+
+
+void vertex(){
+	v_color = COLOR;
+}
+
+
+void light(){
+	float LdotN = dot(LIGHT, NORMAL);
+	
+	vec3 base_color = texture(base,UV).rgb;
+	vec3 shade_color = texture(sss,UV).rgb;
+	vec3 outline_color = texture(ilm, UV).aaa;
+	float shadow_weight = texture(ilm, UV).g;
+	float fade_ao_weight = v_color.r;
+	
+	float shade = LdotN*shadow_weight*fade_ao_weight;
+	float is_shade = step(shade_threshold, shade);
+	if(is_shade>0f){
+		DIFFUSE_LIGHT += base_color;
+	}else{
+		DIFFUSE_LIGHT += (base_color+fade_ao_weight)*shade_color;
+	}
+	DIFFUSE_LIGHT *= outline_color;
+
+	float spec_mask = texture(ilm,UV).r;
+	float spec_shape = texture(ilm,UV).b;
+	float shininess = 32f;
+
+	vec3 halfwayDir = normalize(LIGHT + VIEW);
+	float spec = pow(max(dot(NORMAL, halfwayDir), 0.0), shininess); 
+
+	spec = spec*spec_mask;
+
+	float sm_spec = step(spec_threshold,spec*spec_shape);
+
+	SPECULAR_LIGHT += base_color* sm_spec;
+
+
+}
